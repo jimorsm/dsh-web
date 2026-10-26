@@ -17,7 +17,7 @@
 - **实时标签页，不是定时截图**：CDP `Page.startScreencast` 的帧经一条 WebSocket 送来，来一帧画一帧。标签页显示当前页面、URL 与标题，以及 agent 最近做了什么。
 - **十一个 agent 工具**：`browser_navigate`、`browser_click`、`browser_type`、`browser_press`、`browser_scroll`、`browser_snapshot`、`browser_screenshot`、`browser_console`、`browser_network`、`browser_tabs`、`browser_close`（只关本会话自己打开的标签页）。
 - **证据留在对话里**：每次 `browser_screenshot` 的结果都带图，于是对话记录保留的是 agent 真正看到的那一屏，而不只是一句转述。
-- **一个专用浏览器**：插件自己拉起 Chromium，用一次性 profile。它不会接管你已经登录的浏览器。
+- **一个专用浏览器**：插件自己拉起 Chromium，用一次性 profile。除非你用 `DSH_BROWSER_VIEW_ATTACH_PORT` 显式开启附着模式（见安全模型），它不会接管你已经登录的浏览器。
 - **能进这台机器自己的 GUI**：全新 profile 没有会话 cookie，本来只会看到 401 提示页。当导航落在 loopback 上的那页提示时，插件向宿主的连接服务要一条与 `dsh web` 启动时打印的同样的带票 URL，补一次。种下的 cookie 只活在这个一次性 profile 里，随它一起销毁。
 
 ## 工作原理
@@ -46,9 +46,11 @@ agent 工具调用 ──► 宿主半区 ──► CDP ──► 专用 Chromiu
 ## 安全模型
 
 - **仅限 loopback**：面板 socket 以 loopback 围栏，非本机来源在升级之前就被拒绝。
+- **CIDR 放宽是显式选项**：把 `DSH_BROWSER_VIEW_ALLOWED_CIDRS` 设为逗号分隔的 IPv4 CIDR 列表（例如 `192.168.1.0/24`）后，socket 地址落在列表范围内的请求可以进入面板 socket。放宽不豁免其余请求级门禁：带转发头（宿主前有代理或隧道）的请求仍然拒绝，跨站请求以及 Origin 与 Host 不匹配的请求同样拒绝。未设置或留空即维持原样，仅限 loopback。列出的范围意味着该网络可以驱动浏览器工具，因此只列真正服务 GUI 的最小范围；`::1` 始终允许，列表永远不会放行纯 IPv6 地址。
 - **一次性 profile**：Chrome 跑在系统临时目录下全新的 `--user-data-dir` 上，调试端口随机，用户真实浏览器的 cookie、会话与扩展都够不着。
+- **附着模式是显式选项且不碰你的浏览器**：把 `DSH_BROWSER_VIEW_ATTACH_PORT` 设为一个 DevTools 调试端口，插件就改为驱动那个已在运行的浏览器，而不是自己拉起一个。插件不会替你打开远程调试；需要操作者自己用 `--remote-debugging-port=<端口>` 在 loopback 地址上启动浏览器。附着模式下插件不会杀浏览器、不会碰任何 profile——dispose 只关闭插件自己创建的标签页和它自己的协议会话。代价是真实的：agent 开动的将是一个载着你登录态的浏览器，因此附着模式下每个 agent 工具只能操作调用会话经工具创建的标签页；外来目标（你自己的页面）会被拒绝并附上可用标签页列表，`browser_close` 只关本会话创建的标签页、绝不回落到其他动作。只为一个你接受 agent 在其中工作的浏览器 profile 开启附着模式。
 - **默认无头**：桌面上不会弹出窗口，标签页是唯一的可见视图。
-- **进程寿命**：插件卸载时杀掉 Chromium 子进程。会话关掉之后不会留下还在跑的东西。
+- **进程寿命**：拉起模式下插件卸载时杀掉 Chromium 子进程，会话关掉之后不会留下还在跑的东西；附着模式下浏览器本来就是你的，按设计比插件活得久。
 - **令牌处理**：启动令牌每次导航现取、只在内存里，从不落盘；补票只发生在 loopback 目标且文档确实是 DSH 自己的鉴权页时，因此令牌不会被交给别的本地服务。
 
 ## 已知限制

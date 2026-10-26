@@ -29,11 +29,27 @@ DSH Web GUI 插件 dsh-browser-view（实时浏览器视图）。包级规则：
 
 ## 安全语义
 
-- 面板 socket 只允许 loopback；非本机请求在升级前即拒绝。
-- Chrome 用系统临时目录下的一次性 `--user-data-dir` 与随机调试端口启动；不得改为
-  接管用户已登录的浏览器配置目录。
-- 插件 dispose 时必须杀掉 Chromium 子进程并停掉投屏；修改进程生命周期要同步 README
-  的 `安全模型` 与本节。
+- 面板 socket 默认只允许 loopback；非本机请求在升级前即拒绝。
+  `DSH_BROWSER_VIEW_ALLOWED_CIDRS`（逗号分隔 IPv4 CIDR）是显式放宽：命中的
+  远端地址按同一组请求级门禁放行（转发头依旧一票否决，跨站与跨源依旧拒绝）；
+  未设置或留空即逐字节保持原行为，解析失败的条目要报错而不是静默忽略
+  （`src/host/cidr.ts` 组合 `loopback.ts`，不改那份生成的同步副本）。
+- 拉起模式（默认）：Chrome 用系统临时目录下的一次性 `--user-data-dir` 与随机
+  调试端口启动；不得改为接管用户已登录的浏览器配置目录。
+- 附着模式（`DSH_BROWSER_VIEW_ATTACH_PORT` 设为非空端口）：插件不拉起
+  Chromium，改为向 `http://127.0.0.1:<port>/json/version` 取
+  `webSocketDebuggerUrl` 走既有 CDP 路径（`src/core/browser.ts` 的
+  `resolveBrowserHandle` 是唯一分岔点，service 与 loader 不各写一份）。失败
+  信息必须带端口与最后的具体原因。附着模式下 dispose 绝不杀浏览器、绝不碰
+  任何 profile：只关闭本插件经 `Target.createTarget` 创建的标签页
+  （`closeSessionTargets`）与自己的 CDP 会话。
+- 附着模式下的工具范围：每个会话只能操作它自己创建的标签页（allowlist 即
+  TabManager 记录的 ownerSessionId），外来目标报错并列出可用标签页；
+  `browser_close` 只关本会话创建的标签页，无任何回落路径。拉起模式的既有
+  语义不变。
+- 插件 dispose 时必须按模式收尾：拉起模式杀掉 Chromium 子进程并停掉投屏，
+  附着模式只关自己的标签页与会话。修改进程生命周期要同步 README 的
+  `安全模型` 与本节。
 - 截图只经宿主附件服务（`ctx.get('attachments').saveImage`）落盘，因为 image part 的
   `attachment` ref 必须由该服务签发；除此之外不得把截图副本、页面文本或控制台内容
   写进插件自有目录、日志或缓存。附件服务缺席时 `browser_screenshot` 必须报错，不得

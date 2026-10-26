@@ -23,6 +23,7 @@
 import { CdpClient } from '../core/cdp.ts'
 import type { CdpTransport } from '../core/cdp.ts'
 import { ChromeProcess } from '../core/chrome.ts'
+import { resolveBrowserHandle, type ResolvedBrowser } from '../core/browser.ts'
 import { TabManager, type ScreencastFrame } from '../core/tabs.ts'
 import { buildSnapshot, type SnapshotResult } from '../core/snapshot.ts'
 import { DOCUMENT_TEXT_EXPRESSION, isAuthChallengeText, isLoopbackTarget } from './auth.ts'
@@ -80,7 +81,13 @@ export interface BrowserSession {
   transport: CdpTransport
   /** Tabs of this browser. */
   tabs: TabManager
-  /** The Chrome process; absent when a test supplied its own session. */
+  /**
+   * Whether the plugin spawned this browser (`spawn`, the default) or attached
+   * to one the operator runs (`attach`). An omitted value means spawn: every
+   * session this plugin opened before attach mode existed was spawned.
+   */
+  mode?: 'spawn' | 'attach'
+  /** The Chrome process; absent when a test supplied its own session or the browser is attached. */
   chrome?: ChromeProcess
   /** Stop everything this session owns. */
   dispose(): Promise<void>
@@ -104,19 +111,40 @@ export interface BrowserViewServiceOptions {
   openSession?: (options: { jpegQuality: number; viewport: { width: number; height: number }; onFrame: (frame: ScreencastFrame) => void; onTabsChanged: () => void }) => Promise<BrowserSession>
 }
 
-/** Start Chrome, connect CDP, and wrap both in a session. */
+/**
+ * Close the tabs a session created, for an attached browser.
+ *
+ * An attached browser is the operator's process and profile: dispose closes
+ * only what the plugin created — the tabs it opened via Target.createTarget
+ * and its own CDP session — and never kills the browser or touches any
+ * profile directory. In spawn mode the process kill and profile removal cover
+ * the targets, so nothing is closed here.
+ * @param session - the session being torn down.
+ */
+export async function closeSessionTargets(
+  session: Pick<BrowserSession, 'transport' | 'tabs' | 'mode'>,
+): Promise<void> {
+  if (session.mode !== 'attach') return
+  for (const tab of session.tabs.list()) {
+    await session.tabs.closeTab(tab.id).catch(() => undefined)
+  }
+}
+
+/** Start the browser (or attach to one), connect CDP, and wrap both in a session. */
 async function openDefaultSession(options: {
   jpegQuality: number
   viewport: { width: number; height: number }
   onFrame: (frame: ScreencastFrame) => void
   onTabsChanged: () => void
 }): Promise<BrowserSession> {
-  const chrome = await ChromeProcess.launch({ viewport: options.viewport })
+  // Resolution happens per session start, so an operator can enable attach
+  // mode through the environment without touching a running spawn-mode host.
+  const browser: ResolvedBrowser = await resolveBrowserHandle({ viewport: options.viewport })
   let cdp: CdpClient
   try {
-    cdp = await CdpClient.connect(chrome.info.webSocketDebuggerUrl)
+    cdp = await CdpClient.connect(browser.webSocketDebuggerUrl)
   } catch (error) {
-    await chrome.dispose()
+    await browser.dispose()
     throw error
   }
   const tabs = new TabManager({
@@ -129,11 +157,13 @@ async function openDefaultSession(options: {
   return {
     transport: cdp,
     tabs,
-    chrome,
+    mode: browser.mode,
+    chrome: browser.mode === 'spawn' ? browser.chrome : undefined,
     async dispose() {
+      await closeSessionTargets({ transport: cdp, tabs, mode: browser.mode })
       await tabs.dispose()
       cdp.close()
-      await chrome.dispose()
+      await browser.dispose()
     },
   }
 }
@@ -358,6 +388,7 @@ export class BrowserViewService implements BrowserViewBackend {
     if (tabId !== undefined && tabId !== '') {
       const found = tabs.list().find(tab => tab.id === tabId)
       if (found === undefined) throw new Error(`unknown tab "${tabId}"; call browser_tabs to see the open tabs`)
+      if (this.isAttachMode()) this.requireOwnedTab(found, sessionId)
       if (sessionId !== undefined) this.bindings.set(sessionId, found.id)
       this.focusFollowed(found.id)
       return found
@@ -373,21 +404,49 @@ export class BrowserViewService implements BrowserViewBackend {
         this.bindings.delete(sessionId)
       }
     }
-    const watching = this.displayedOrDefault()
-    if (watching !== null) {
-      const found = tabs.list().find(tab => tab.id === watching)
-      // Safety invariant, not a default-value preference: one tool navigation
-      // must never drive the page the user is watching. A page another session
-      // owns is therefore not this session's to drive — falling through to a
-      // tab of its own is what holds that invariant, and this guard is what
-      // makes it a property rather than an accident of ordering.
-      if (found !== undefined && !this.ownedByOtherSession(found.id, sessionId)) {
-        if (sessionId !== undefined) this.bindings.set(sessionId, found.id)
-        this.focusFollowed(found.id)
-        return found
+    if (!this.isAttachMode()) {
+      const watching = this.displayedOrDefault()
+      if (watching !== null) {
+        const found = tabs.list().find(tab => tab.id === watching)
+        // Safety invariant, not a default-value preference: one tool navigation
+        // must never drive the page the user is watching. A page another session
+        // owns is therefore not this session's to drive — falling through to a
+        // tab of its own is what holds that invariant, and this guard is what
+        // makes it a property rather than an accident of ordering.
+        if (found !== undefined && !this.ownedByOtherSession(found.id, sessionId)) {
+          if (sessionId !== undefined) this.bindings.set(sessionId, found.id)
+          this.focusFollowed(found.id)
+          return found
+        }
       }
     }
+    // In attach mode the watched-tab fallback is skipped entirely: every tab
+    // this session may touch is one it created, and ensureTab binds or creates
+    // exactly such a tab.
     return await this.ensureTab(sessionId)
+  }
+
+  /** Whether the running browser is one the operator owns (attach mode). */
+  private isAttachMode(): boolean {
+    return this.session?.mode === 'attach'
+  }
+
+  /**
+   * Enforce the attach-mode target allowlist: a session may only operate a
+   * tab it created via Target.createTarget, never a foreign one.
+   * @param found - the tab the call named.
+   * @param sessionId - the calling session.
+   * @throws Error listing the tabs this session may use when the tab is foreign.
+   */
+  private requireOwnedTab(found: BrowserTabView, sessionId: string | undefined): void {
+    if (found.sessionId === sessionId) return
+    const allowed = this.session?.tabs.list().filter(tab => tab.sessionId === sessionId) ?? []
+    const allowedText = allowed.length === 0
+      ? 'this session has none yet; create one with browser_navigate (new_tab or a fresh session creates one)'
+      : allowed.map(tab => `"${tab.id}" (${tab.url})`).join(', ')
+    throw new Error(
+      `tab "${found.id}" was not opened by this session. Attach mode only allows tabs this session created via the tools; allowed tabs: ${allowedText}`,
+    )
   }
 
   /**

@@ -32,6 +32,7 @@ import {
   type BrowserViewEvent,
 } from '../core/protocol.ts'
 import { isLoopbackRequest } from './loopback.ts'
+import { requestAllowedByCidr, type Cidr4 } from './cidr.ts'
 import type { BrowserViewBackend, BrowserViewSink } from './service.ts'
 
 /** Status route of the family; the panel's fallback probe when the socket fails. */
@@ -140,6 +141,23 @@ export function socketSink(socket: WebSocket): BrowserViewSink {
 export interface BrowserViewRoutesDeps {
   /** The browser service (tests pass a stub). */
   backend: BrowserViewBackend
+  /**
+   * The parsed `DSH_BROWSER_VIEW_ALLOWED_CIDRS` list. Empty (the default)
+   * keeps the fence loopback-only; a listed CIDR admits requests whose socket
+   * address sits inside it, under the same request-level gates.
+   */
+  allowedCidrs?: readonly Cidr4[]
+}
+
+/**
+ * The request fence of this route family: loopback always, plus the opt-in
+ * CIDR widening when the operator listed ranges.
+ * @param req - the incoming request.
+ * @param cidrs - the parsed CIDR list.
+ * @returns true when the request may be served.
+ */
+export function isRequestFenced(req: IncomingMessage, cidrs: readonly Cidr4[]): boolean {
+  return isLoopbackRequest(req) || requestAllowedByCidr(req, cidrs)
 }
 
 /**
@@ -149,13 +167,14 @@ export interface BrowserViewRoutesDeps {
  */
 export function makeRoutes(deps: BrowserViewRoutesDeps): { routes: WebRoute[]; upgrade: WebUpgradeRoute } {
   const { backend } = deps
+  const cidrs = deps.allowedCidrs ?? []
 
   const routes: WebRoute[] = [
     {
       kind: 'exact',
       path: BROWSER_VIEW_STATE_PATH,
       handler: (req: IncomingMessage, res: ServerResponse) => {
-        if (!isLoopbackRequest(req)) {
+        if (!isRequestFenced(req, cidrs)) {
           writeJson(res, 403, { error: 'forbidden: loopback-only' })
           return
         }
@@ -171,7 +190,7 @@ export function makeRoutes(deps: BrowserViewRoutesDeps): { routes: WebRoute[]; u
   const upgrade: WebUpgradeRoute = {
     path: BROWSER_VIEW_SOCKET_PATH,
     handler: (req: IncomingMessage, socket: Duplex, head: Buffer) => {
-      if (!isLoopbackRequest(req)) {
+      if (!isRequestFenced(req, cidrs)) {
         socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n')
         socket.destroy()
         return

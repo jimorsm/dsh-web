@@ -25,6 +25,7 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-tools'
 import { BrowserViewService } from './host/service.ts'
 import { makeRoutes } from './host/routes.ts'
+import { ALLOWED_CIDRS_ENV, parseCidrList } from './host/cidr.ts'
 import { createBrowserTools, type DurableImageRef } from './host/tools.ts'
 
 /** Stable cordis plugin name. */
@@ -84,7 +85,10 @@ export function apply(ctx: Context): void {
     return await attachments.saveImage(input)
   }
 
-  const { routes, upgrade } = makeRoutes({ backend: service })
+  // The socket fence is read once at mount: the env var is host-process
+  // configuration, not per-request state. Unset or empty keeps loopback-only.
+  const allowedCidrs = parseCidrList(process.env[ALLOWED_CIDRS_ENV])
+  const { routes, upgrade } = makeRoutes({ backend: service, allowedCidrs })
   const tools = createBrowserTools({ service, saveImage })
 
   ctx.effect(() => {

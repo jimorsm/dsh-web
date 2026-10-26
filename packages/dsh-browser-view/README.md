@@ -17,7 +17,7 @@ This package is an external plugin for DeepSeek Harness (DSH), structured as a c
 - **A live tab, not a screenshot poll**: CDP `Page.startScreencast` frames arrive over one WebSocket and are painted as they come. The tab shows the active page, its URL and title, and what the agent last did.
 - **Eleven agent tools**: `browser_navigate`, `browser_click`, `browser_type`, `browser_press`, `browser_scroll`, `browser_snapshot`, `browser_screenshot`, `browser_console`, `browser_network`, `browser_tabs`, `browser_close` (closes only the tabs this session opened).
 - **Evidence in the conversation**: every `browser_screenshot` result carries the image, so the transcript keeps the picture the agent acted on instead of only a sentence about it.
-- **One dedicated browser**: the plugin launches its own Chromium with a throwaway profile. It never attaches to a browser you are signed into.
+- **One dedicated browser**: the plugin launches its own Chromium with a throwaway profile. It never attaches to a browser you are signed into unless you opt in with `DSH_BROWSER_VIEW_ATTACH_PORT` (see Security model).
 - **Signs itself in to this host's own GUI**: a fresh profile has no session cookie, so the viewer would only ever see the 401 challenge. When a navigation lands on that challenge over loopback, the plugin asks the host's connection service for the same ticketed URL `dsh web` printed, and retries once. The cookie that mints lives in the throwaway profile and dies with it.
 
 ## How it works
@@ -46,9 +46,11 @@ The single-occupant `rightbar` / `rightbar.session` seats are still not touched:
 ## Security model
 
 - **Loopback only**: the panel socket is fenced to loopback requests; a non-local client is rejected before the upgrade.
+- **Opt-in CIDR widening**: setting `DSH_BROWSER_VIEW_ALLOWED_CIDRS` to a comma-separated list of IPv4 CIDR ranges (for example `192.168.1.0/24`) admits panel socket requests whose socket address falls inside a listed range. The widening keeps the other request-level gates: a request carrying forwarding headers (a proxy or tunnel in front of the host) is still refused, as is a cross-site request or one whose Origin does not match the Host. Unset or empty means loopback-only, unchanged. A listed range can drive the browser tools from that network, so list the narrowest range that actually serves the GUI; `::1` stays always allowed and the list never admits pure IPv6 addresses.
 - **Throwaway profile**: Chrome runs on a fresh `--user-data-dir` under the system temp directory with a random debugging port, so no cookie, session or extension of the user's real browser is reachable.
+- **Attach mode is opt-in and hands-off**: setting `DSH_BROWSER_VIEW_ATTACH_PORT` to a DevTools debugging port makes the plugin drive that already-running browser instead of launching one. The plugin never enables remote debugging itself; the operator starts the browser with `--remote-debugging-port=<port>` on a loopback address. In attach mode the plugin does not kill the browser and does not touch any profile — dispose only closes the tabs the plugin itself created and its own protocol session. The trade-off is real: the agent is now driving a browser that holds your sessions, so in attach mode every agent tool may only operate tabs the calling session created via the tools; a foreign target (your own page) is refused with the list of allowed tabs, and `browser_close` closes only session-created tabs and never falls through to anything else. Only turn attach mode on for a browser profile you accept the agent working inside.
 - **Headless by default**: nothing pops up on the desktop; the tab is the only view.
-- **Process lifetime**: the Chromium child is killed when the plugin disposes. Nothing is left running behind a closed session.
+- **Process lifetime**: in spawn mode the Chromium child is killed when the plugin disposes. Nothing is left running behind a closed session. In attach mode the browser is yours and outlives the plugin by design.
 - **Token handling**: the launch token is minted per navigation, held in memory, and never written to disk; the retry only happens on a loopback target whose document is DSH's own challenge, so no other local service is ever handed the token.
 
 ## Known limits
